@@ -171,7 +171,7 @@ git clone https://github.com/your-org/serverless-invoice-processor.git
 cd serverless-invoice-processor
 
 # Create and activate virtual environment
-python3.14 -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate        # macOS/Linux
 # .venv\Scripts\activate         # Windows
 
