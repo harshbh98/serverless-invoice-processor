@@ -13,6 +13,7 @@ Supported file types: JPG, PNG, PDF, TIFF
 
 import os
 import logging
+from urllib.parse import unquote_plus
 import boto3
 from extractor import parse_expense_document, get_overall_confidence, is_valid_invoice
 
@@ -60,7 +61,7 @@ def lambda_handler(event: dict, context) -> dict:
 
     for record in event.get("Records", []):
         bucket = record["s3"]["bucket"]["name"]
-        key    = record["s3"]["object"]["key"]
+        key    = unquote_plus(record["s3"]["object"]["key"])
 
         # Guard — only handle files from the submit folder
         if not key.startswith(f"{SUBMIT_FOLDER}/"):
