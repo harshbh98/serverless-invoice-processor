@@ -1,38 +1,60 @@
 """
 invoice_processor — AWS Lambda (Python 3.14)
 =============================================
-Serverless invoice processing pipeline.
+Serverless invoice processing pipeline with two-path Textract routing.
+
+Path A — Scanned / image-based documents (JPG, PNG, scanned PDF):
+  Textract AnalyzeExpense  →  structured expense fields
+
+Path B — Digitally created PDFs (Word → PDF, Excel → PDF):
+  Textract AnalyzeDocument →  FORMS + TABLES key-value extraction
 
 S3 Folder Flow:
-  submitted-invoices/  →  Lambda  →  Textract AnalyzeExpense
+  submitted-invoices/  →  Lambda  →  Textract (Path A or B)
       ├── confidence >= 80%  →  DynamoDB (auto-processed)
       └── confidence <  80%  →  invoices-to-be-reviewed/  +  SNS alert
-
-Supported file types: JPG, PNG, PDF, TIFF
 """
 
 import os
 import logging
 from urllib.parse import unquote_plus
+
 import boto3
-from extractor import parse_expense_document, get_overall_confidence, is_valid_invoice
+from botocore.exceptions import ClientError
+
+from extractor import (
+    parse_expense_document,
+    parse_document_blocks,
+    get_overall_confidence,
+    get_blocks_confidence,
+    is_valid_invoice,
+    is_valid_invoice_from_blocks,
+)
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-# ── AWS clients (initialised once on cold start) ──────────────────────────────
+# ── AWS clients ───────────────────────────────────────────────────────────────
 _textract = boto3.client("textract")
 _dynamodb = boto3.resource("dynamodb")
 _s3       = boto3.client("s3")
 _sns      = boto3.client("sns")
 
-# ── Configuration from Lambda environment variables ───────────────────────────
-TABLE_NAME            = os.environ.get("DYNAMODB_TABLE",        "InvoiceExpenses")
-SUBMIT_FOLDER         = os.environ.get("SUBMIT_FOLDER",         "submitted-invoices")
-REVIEW_FOLDER         = os.environ.get("REVIEW_FOLDER",         "invoices-to-be-reviewed")
-CONFIDENCE_THRESHOLD  = float(os.environ.get("CONFIDENCE_THRESHOLD", "80.0"))
-SNS_TOPIC_ARN         = os.environ.get("SNS_TOPIC_ARN",         "")
+# ── Config ────────────────────────────────────────────────────────────────────
+TABLE_NAME           = os.environ.get("DYNAMODB_TABLE",        "InvoiceExpenses")
+SUBMIT_FOLDER        = os.environ.get("SUBMIT_FOLDER",         "submitted-invoices")
+REVIEW_FOLDER        = os.environ.get("REVIEW_FOLDER",         "invoices-to-be-reviewed")
+CONFIDENCE_THRESHOLD = float(os.environ.get("CONFIDENCE_THRESHOLD", "80.0"))
+SNS_TOPIC_ARN        = os.environ.get("SNS_TOPIC_ARN",         "")
+
+# Textract error codes that mean "bad document" — handle gracefully, not crash
+GRACEFUL_TEXTRACT_ERRORS = {
+    "UnsupportedDocumentException",
+    "BadDocumentException",
+    "InvalidS3ObjectException",
+    "ProvisionedThroughputExceededException",
+}
 
 _table = _dynamodb.Table(TABLE_NAME)
 
@@ -40,20 +62,14 @@ _table = _dynamodb.Table(TABLE_NAME)
 # ── Lambda Entry Point ────────────────────────────────────────────────────────
 def lambda_handler(event: dict, context) -> dict:
     """
-    Main handler — triggered by S3 ObjectCreated events from submitted-invoices/.
+    Main handler triggered by S3 ObjectCreated events.
 
     For each uploaded file:
-      1. Call Textract AnalyzeExpense
-      2. Validate it is actually an invoice
-      3a. Confidence >= threshold  →  parse + save to DynamoDB
-      3b. Confidence <  threshold  →  move to review folder + SNS alert
-
-    Args:
-        event:   AWS S3 event payload
-        context: Lambda runtime context (unused)
-
-    Returns:
-        dict summarising processed and reviewed file counts
+      1. Try Textract AnalyzeExpense (Path A — scanned / image-based docs)
+      2. If UnsupportedDocumentException → fallback to AnalyzeDocument (Path B — digital PDFs)
+      3. Validate extracted data looks like an invoice
+      4a. Confidence >= threshold  →  save to DynamoDB
+      4b. Confidence <  threshold  →  move to review folder + SNS alert
     """
     processed       = []
     moved_to_review = []
@@ -63,72 +79,60 @@ def lambda_handler(event: dict, context) -> dict:
         bucket = record["s3"]["bucket"]["name"]
         key    = unquote_plus(record["s3"]["object"]["key"])
 
-        # Guard — only handle files from the submit folder
+        # Guard — only process files from the submit folder
         if not key.startswith(f"{SUBMIT_FOLDER}/"):
             logger.info("⏭️  Skipping %s — not in %s/", key, SUBMIT_FOLDER)
             continue
 
-        # Guard — ignore folder-creation events (keys ending with /)
+        # Guard — ignore folder-creation events
         if key.endswith("/"):
             continue
 
         logger.info("📄 Processing: s3://%s/%s", bucket, key)
 
         try:
-            # ── Step 1: Textract ──────────────────────────────────────────────
-            response     = _textract.analyze_expense(
-                Document={"S3Object": {"Bucket": bucket, "Name": key}}
-            )
-            expense_docs = response.get("ExpenseDocuments", [])
+            result = _extract_invoice_data(bucket, key)
 
-            if not expense_docs:
-                logger.warning("⚠️  Textract found no expense data in %s", key)
-                new_key = _move_to_review(bucket, key, "No expense data detected by Textract")
+            if result is None:
+                # Unrecoverable extraction failure — already moved to review
                 moved_to_review.append(key)
-                if SNS_TOPIC_ARN:
-                    _send_review_alert(bucket, key, new_key, 0.0, {})
                 continue
 
-            for idx, expense_doc in enumerate(expense_docs):
+            invoice, confidence, extraction_path = result
 
-                # ── Step 2: Validate it looks like an invoice ─────────────────
-                valid, validation_reason = is_valid_invoice(expense_doc)
-                if not valid:
-                    logger.warning("⛔ Not an invoice — %s: %s", key, validation_reason)
-                    new_key = _move_to_review(bucket, key, validation_reason)
-                    moved_to_review.append(key)
-                    if SNS_TOPIC_ARN:
-                        _send_review_alert(bucket, key, new_key, 0.0, expense_doc,
-                                           extra_reason=validation_reason)
-                    continue
+            logger.info(
+                "📊 Path=%s | Confidence=%.1f%% | Threshold=%.1f%%",
+                extraction_path, confidence, CONFIDENCE_THRESHOLD,
+            )
 
-                # ── Step 3: Confidence gate ───────────────────────────────────
-                confidence = get_overall_confidence(expense_doc)
-                logger.info("📊 Confidence: %.1f%% | Threshold: %.1f%%",
-                            confidence, CONFIDENCE_THRESHOLD)
+            if confidence >= CONFIDENCE_THRESHOLD:
+                # ── HIGH CONFIDENCE → DynamoDB ────────────────────────────────
+                _table.put_item(Item=invoice)
+                logger.info(
+                    "✅ Saved invoice %s (path=%s, confidence=%.1f%%)",
+                    invoice["invoiceId"], extraction_path, confidence,
+                )
+                processed.append({
+                    "key":             key,
+                    "invoiceId":       invoice["invoiceId"],
+                    "confidence":      confidence,
+                    "extractionPath":  extraction_path,
+                })
 
-                if confidence >= CONFIDENCE_THRESHOLD:
-                    # ── HIGH CONFIDENCE → DynamoDB ────────────────────────────
-                    invoice = parse_expense_document(expense_doc, bucket, key, idx)
-                    _table.put_item(Item=invoice)
-                    logger.info("✅ Saved invoice %s (confidence %.1f%%)",
-                                invoice["invoiceId"], confidence)
-                    processed.append({
-                        "key":        key,
-                        "invoiceId":  invoice["invoiceId"],
-                        "confidence": confidence,
-                    })
-
-                else:
-                    # ── LOW CONFIDENCE → review folder + SNS ──────────────────
-                    reason  = (f"Confidence {confidence:.1f}% is below "
-                               f"threshold {CONFIDENCE_THRESHOLD}%")
-                    new_key = _move_to_review(bucket, key, reason)
-                    moved_to_review.append(key)
-                    logger.warning("📋 Moved to review: %s (%s)", key, reason)
-
-                    if SNS_TOPIC_ARN:
-                        _send_review_alert(bucket, key, new_key, confidence, expense_doc)
+            else:
+                # ── LOW CONFIDENCE → review folder + SNS ─────────────────────
+                reason  = (
+                    f"Confidence {confidence:.1f}% is below "
+                    f"threshold {CONFIDENCE_THRESHOLD}% "
+                    f"(extraction path: {extraction_path})"
+                )
+                new_key = _move_to_review(bucket, key, reason)
+                moved_to_review.append(key)
+                if SNS_TOPIC_ARN:
+                    _send_review_alert(
+                        bucket, key, new_key, confidence, invoice,
+                        extraction_path=extraction_path,
+                    )
 
         except Exception as exc:
             msg = f"❌ Failed for s3://{bucket}/{key}: {exc}"
@@ -140,42 +144,160 @@ def lambda_handler(event: dict, context) -> dict:
 
     logger.info(
         "🏁 Done — processed: %d | sent to review: %d",
-        len(processed), len(moved_to_review)
+        len(processed), len(moved_to_review),
     )
     return {
-        "statusCode":     200,
-        "processed":      processed,
-        "movedToReview":  moved_to_review,
+        "statusCode":    200,
+        "processed":     processed,
+        "movedToReview": moved_to_review,
     }
+
+
+# ── Two-Path Textract Extraction ──────────────────────────────────────────────
+def _extract_invoice_data(
+    bucket: str,
+    key:    str,
+) -> tuple[dict, float, str] | None:
+    """
+    Attempts invoice data extraction using a two-path strategy:
+
+    Path A — AnalyzeExpense (scanned/image-based docs):
+        Best for photos, scanned PDFs, JPG/PNG invoices.
+        Returns structured expense fields directly.
+
+    Path B — AnalyzeDocument (digital PDFs):
+        Fallback when AnalyzeExpense raises UnsupportedDocumentException.
+        Uses FORMS + TABLES feature to extract key-value pairs and tables
+        from digitally generated PDFs (e.g. Word → PDF).
+
+    Returns:
+        (invoice_dict, confidence_score, path_label) on success
+        None if the document could not be processed — file moved to review
+    """
+
+    # ── PATH A: AnalyzeExpense ────────────────────────────────────────────────
+    try:
+        logger.info("🔍 Path A — AnalyzeExpense for %s", key)
+        response     = _textract.analyze_expense(
+            Document={"S3Object": {"Bucket": bucket, "Name": key}}
+        )
+        expense_docs = response.get("ExpenseDocuments", [])
+
+        if not expense_docs:
+            logger.warning("⚠️  AnalyzeExpense returned no documents for %s", key)
+            reason = "Textract AnalyzeExpense returned no expense documents"
+            _move_to_review(bucket, key, reason)
+            if SNS_TOPIC_ARN:
+                _send_review_alert(bucket, key,
+                                   f"{REVIEW_FOLDER}/{key.split('/')[-1]}",
+                                   0.0, {}, extra_reason=reason)
+            return None
+
+        # Use first expense document (single-page invoices)
+        expense_doc = expense_docs[0]
+
+        # Validate it looks like an invoice
+        valid, reason = is_valid_invoice(expense_doc)
+        if not valid:
+            logger.warning("⛔ Gate 1 failed (Path A) — %s: %s", key, reason)
+            new_key = _move_to_review(bucket, key, reason)
+            if SNS_TOPIC_ARN:
+                _send_review_alert(bucket, key, new_key, 0.0, {},
+                                   extra_reason=reason)
+            return None
+
+        confidence = get_overall_confidence(expense_doc)
+        invoice    = parse_expense_document(expense_doc, bucket, key, 0)
+        invoice["extractionPath"] = "A-AnalyzeExpense"
+        return invoice, confidence, "A-AnalyzeExpense"
+
+    except ClientError as e:
+        error_code = e.response["Error"]["Code"]
+
+        if error_code == "UnsupportedDocumentException":
+            # Expected for digital PDFs — fall through to Path B
+            logger.info(
+                "↩️  Path A unsupported for %s — falling back to Path B (AnalyzeDocument)",
+                key,
+            )
+        elif error_code in GRACEFUL_TEXTRACT_ERRORS:
+            # Other known rejections — move to review, don't crash
+            reason = f"Textract rejected file ({error_code}): {e.response['Error']['Message']}"
+            logger.warning("⛔ %s — %s", key, reason)
+            new_key = _move_to_review(bucket, key, reason)
+            if SNS_TOPIC_ARN:
+                _send_review_alert(bucket, key, new_key, 0.0, {},
+                                   extra_reason=reason)
+            return None
+        else:
+            raise   # unexpected AWS error — let outer handler catch it
+
+    # ── PATH B: AnalyzeDocument ───────────────────────────────────────────────
+    try:
+        logger.info("🔍 Path B — AnalyzeDocument for %s", key)
+        response = _textract.analyze_document(
+            Document={"S3Object": {"Bucket": bucket, "Name": key}},
+            FeatureTypes=["TABLES", "FORMS"],
+        )
+        blocks = response.get("Blocks", [])
+
+        if not blocks:
+            reason = "Textract AnalyzeDocument returned no blocks"
+            logger.warning("⚠️  %s — %s", key, reason)
+            new_key = _move_to_review(bucket, key, reason)
+            if SNS_TOPIC_ARN:
+                _send_review_alert(bucket, key, new_key, 0.0, {},
+                                   extra_reason=reason)
+            return None
+
+        # Validate it looks like an invoice
+        valid, reason = is_valid_invoice_from_blocks(blocks)
+        if not valid:
+            logger.warning("⛔ Gate 1 failed (Path B) — %s: %s", key, reason)
+            new_key = _move_to_review(bucket, key, reason)
+            if SNS_TOPIC_ARN:
+                _send_review_alert(bucket, key, new_key, 0.0, {},
+                                   extra_reason=reason)
+            return None
+
+        confidence = get_blocks_confidence(blocks)
+        invoice    = parse_document_blocks(blocks, bucket, key)
+        invoice["extractionPath"] = "B-AnalyzeDocument"
+        return invoice, confidence, "B-AnalyzeDocument"
+
+    except ClientError as e:
+        error_code = e.response["Error"]["Code"]
+        if error_code in GRACEFUL_TEXTRACT_ERRORS:
+            reason = f"Path B also failed ({error_code}): {e.response['Error']['Message']}"
+            logger.warning("⛔ %s — %s", key, reason)
+            new_key = _move_to_review(bucket, key, reason)
+            if SNS_TOPIC_ARN:
+                _send_review_alert(bucket, key, new_key, 0.0, {},
+                                   extra_reason=reason)
+            return None
+        raise
 
 
 # ── S3 Move Helper ────────────────────────────────────────────────────────────
 def _move_to_review(bucket: str, source_key: str, reason: str) -> str:
     """
-    Copies the file from submitted-invoices/ to invoices-to-be-reviewed/
-    preserving the filename, then deletes the original.
-
-    Attaches the rejection reason as S3 object metadata so reviewers
-    can see it in the AWS console without opening the file.
-
+    Copies file from submitted-invoices/ to invoices-to-be-reviewed/
+    with rejection reason stored as S3 object metadata, then deletes original.
     Returns the new S3 key.
     """
     filename = source_key.split("/")[-1]
     dest_key = f"{REVIEW_FOLDER}/{filename}"
 
-    # Copy with metadata
     _s3.copy_object(
         Bucket=bucket,
         CopySource={"Bucket": bucket, "Key": source_key},
         Key=dest_key,
         Metadata={
-            "review-reason":    reason[:256],        # S3 metadata max 2KB per key
-            "original-s3-key":  source_key,
+            "review-reason":   reason[:256],
+            "original-s3-key": source_key,
         },
         MetadataDirective="REPLACE",
     )
-
-    # Delete from submit folder
     _s3.delete_object(Bucket=bucket, Key=source_key)
 
     logger.info("📁 Moved  %s  →  %s", source_key, dest_key)
@@ -184,29 +306,36 @@ def _move_to_review(bucket: str, source_key: str, reason: str) -> str:
 
 # ── SNS Alert Helper ──────────────────────────────────────────────────────────
 def _send_review_alert(
-    bucket:       str,
-    original_key: str,
-    review_key:   str,
-    confidence:   float,
-    expense_doc:  dict,
-    extra_reason: str = "",
+    bucket:          str,
+    original_key:    str,
+    review_key:      str,
+    confidence:      float,
+    invoice:         dict,
+    extraction_path: str = "",
+    extra_reason:    str = "",
 ) -> None:
     """
-    Publishes an email alert via SNS so the human reviewer is notified
-    immediately with full context — filename, confidence score, and
-    whatever partial data Textract managed to extract.
+    Publishes SNS email alert with full context for the human reviewer.
+    SNS failures are caught and logged — never crashes the Lambda.
     """
     filename = original_key.split("/")[-1]
-    vendor   = _get_field(expense_doc, "VENDOR_NAME")
-    total    = _get_field(expense_doc, "TOTAL") or _get_field(expense_doc, "AMOUNT_PAID")
-    inv_date = _get_field(expense_doc, "INVOICE_RECEIPT_DATE")
-    inv_num  = _get_field(expense_doc, "INVOICE_RECEIPT_ID")
+    vendor   = invoice.get("vendorName",    "Not detected")
+    total    = invoice.get("totalAmount",   "Not detected")
+    inv_date = invoice.get("invoiceDate",   "Not detected")
+    inv_num  = invoice.get("invoiceNumber", "Not detected")
 
     if extra_reason:
-        rejection_line = f"  Reason       : {extra_reason}"
+        confidence_line = f"  Reason          : {extra_reason}"
     else:
-        rejection_line = (f"  Confidence   : {confidence:.1f}%  "
-                          f"(threshold: {CONFIDENCE_THRESHOLD}%)")
+        confidence_line = (
+            f"  Confidence      : {confidence:.1f}%  "
+            f"(threshold: {CONFIDENCE_THRESHOLD}%)"
+        )
+
+    path_line = (
+        f"  Extraction Path : {extraction_path}"
+        if extraction_path else ""
+    )
 
     subject = f"[Invoice Review Required] {filename}"
     message = f"""
@@ -215,45 +344,36 @@ An invoice could not be automatically processed and requires human review.
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   FILE DETAILS
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  File Name    : {filename}
-  S3 Location  : s3://{bucket}/{review_key}
-{rejection_line}
+  File Name       : {filename}
+  S3 Location     : s3://{bucket}/{review_key}
+{confidence_line}
+{path_line}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   EXTRACTED DATA (partial / low confidence)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  Vendor       : {vendor   or 'Not detected'}
-  Total Amount : {total    or 'Not detected'}
-  Invoice Date : {inv_date or 'Not detected'}
-  Invoice No.  : {inv_num  or 'Not detected'}
+  Vendor          : {vendor}
+  Total Amount    : {total}
+  Invoice Date    : {inv_date}
+  Invoice No.     : {inv_num}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   ACTION REQUIRED
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  1. Open the file:  s3://{bucket}/{review_key}
-  2. Verify the invoice details manually
+  1. Open the file : s3://{bucket}/{review_key}
+  2. Verify invoice details manually
   3. Enter data into DynamoDB table '{TABLE_NAME}' if valid
   4. Delete the file from the review folder once done
 
-This is an automated alert from the Invoice Processor Lambda function.
+This is an automated alert from the Invoice Processor Lambda.
 """
 
     try:
         _sns.publish(
             TopicArn=SNS_TOPIC_ARN,
-            Subject=subject[:100],          # SNS subject max 100 chars
+            Subject=subject[:100],
             Message=message,
         )
         logger.info("📧 SNS alert sent for %s", filename)
     except Exception as exc:
-        # Never let SNS failure crash the Lambda — just log it
         logger.error("⚠️  SNS publish failed for %s: %s", filename, exc)
-
-
-# ── Field extraction helper ───────────────────────────────────────────────────
-def _get_field(expense_doc: dict, field_type: str) -> str:
-    """Pull a single field value from an expense doc summary."""
-    for field in expense_doc.get("SummaryFields", []):
-        if (field.get("Type") or {}).get("Text", "").upper() == field_type:
-            return ((field.get("ValueDetection") or {}).get("Text") or "").strip()
-    return ""
